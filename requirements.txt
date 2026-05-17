@@ -1,0 +1,8 @@
+# freeform-mcp requirements
+# Install with: pip install -r requirements.txt
+
+mcp[cli]>=1.0.0
+fastmcp>=0.1.0
+pyautogui>=0.9.54
+Pillow>=10.0.0
+pyobjc-framework-Quartz>=10.0
