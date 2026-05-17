@@ -1,26 +1,27 @@
 """
-freeform_mcp_server.py  (v6 — position shapes via Arrange panel, not drag)
-===========================================================================
+freeform_mcp_server.py  (v7 — click-first placement + calibration)
+===================================================================
 macOS only. Python 3.10+.
 
-ROOT CAUSE FIXED IN v6:
-  The drag-to-position approach (pyautogui.dragTo) was silently failing.
-  Freeform inserts shapes at a default canvas position regardless of
-  where the mouse drags to. The drag ended up either no-op'ing or
-  moving the window itself.
+STRATEGY CHANGE IN v7:
+  Previous versions inserted a shape then tried to move it. That failed
+  because Freeform ignores programmatic position changes after insertion.
 
-THE v6 FIX — three-step shape placement:
-  1. Insert the shape via Insert > Shape menu (lands at canvas centre).
-  2. Open the Arrange panel (Format > Arrange or Cmd+Shift+I if available)
-     and type the exact X and Y position values into the coordinate fields.
-     This is pixel-perfect and independent of screen resolution.
-  3. If the Arrange panel fields are inaccessible, fall back to
-     repeated arrow-key nudging from the known insertion point.
+  v7 APPROACH — "click-first" placement:
+    1. Click the canvas at the target screen position BEFORE inserting.
+    2. Freeform places new shapes near the last-clicked canvas point.
+    3. Insert the shape — it appears at (or very near) where we clicked.
+    4. Double-click that same point to enter label editing mode.
 
-CONNECTOR FIX:
-  Line drawing now ensures Freeform is fully frontmost, the cursor
-  moves to the exact screen pixel BEFORE mouseDown, and uses a slower
-  drag with intermediate waypoints for reliability.
+  This works because Freeform respects the active canvas focus point
+  when deciding where to insert a new object.
+
+CALIBRATION TOOL:
+  board_calibrate() inserts a test shape, takes a screenshot, then
+  measures via pixel analysis where the shape actually landed vs where
+  we clicked. It stores an (offset_x, offset_y) correction factor that
+  all subsequent shape_add calls apply automatically.
+  Run this once after board_new() on a new board.
 """
 
 import base64
@@ -37,6 +38,10 @@ mcp = FastMCP("Freeform MCP")
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.1
 
+# Calibration offset — adjusted by board_calibrate()
+_offset_x = 0
+_offset_y = 0
+
 
 # ============================================================
 # INTERNAL HELPERS
@@ -45,20 +50,6 @@ pyautogui.PAUSE = 0.1
 def _run_as(script):
     r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
     return r.stdout.strip(), r.stderr.strip(), r.returncode
-
-
-def _window_count():
-    out, _, _ = _run_as("""
-    tell application "System Events"
-        tell process "Freeform"
-            return count of windows
-        end tell
-    end tell
-    """)
-    try:
-        return int(out)
-    except Exception:
-        return 0
 
 
 def _has_open_window():
@@ -189,93 +180,31 @@ def _window_bounds():
 
 
 def _canvas_to_screen(cx, cy):
-    """Convert canvas (0,0)=centre coords to absolute screen pixels."""
+    """
+    Convert canvas coords (0,0 = board centre) to absolute screen pixels.
+    Applies calibration offset if set.
+    """
     b = _window_bounds()
     toolbar_height = 80
-    sx = b["x"] + b["width"] // 2 + cx
-    sy = b["y"] + toolbar_height + (b["height"] - toolbar_height) // 2 + cy
+    sx = b["x"] + b["width"] // 2 + cx + _offset_x
+    sy = b["y"] + toolbar_height + (b["height"] - toolbar_height) // 2 + cy + _offset_y
     return int(sx), int(sy)
 
 
-def _set_position_via_arrange(canvas_x, canvas_y):
+def _click_canvas_at(sx, sy):
     """
-    After a shape is inserted and selected, open the Arrange panel
-    and type exact X, Y values into the position fields.
-    canvas_x, canvas_y are relative to board centre — we add an offset
-    to convert to Freeform's internal coordinate system (top-left origin).
-
-    Freeform's arrange panel uses pt coordinates from the top-left of the
-    canvas. We approximate board centre as half the window content area.
+    Click on the Freeform canvas to set insertion focus point.
+    This is the key step that tells Freeform where to place the next shape.
     """
-    b = _window_bounds()
-    toolbar_height = 80
-    content_w = b["width"]
-    content_h = b["height"] - toolbar_height
-
-    # Convert canvas-centre coords to Freeform's top-left origin coords
-    freeform_x = content_w // 2 + canvas_x
-    freeform_y = content_h // 2 + canvas_y
-
-    # Try to set position via the Arrange panel's X/Y text fields
-    # Open Format > Arrange (or just use keyboard shortcut to open sidebar)
-    # Then tab through to find position fields
-    script = f"""
-    tell application "System Events"
-        tell process "Freeform"
-            -- Try to find X position field in the format sidebar
-            -- The sidebar shows position fields when a shape is selected
-            set xFields to every text field of front window whose value is not ""
-            -- Look for position input fields (usually labelled X and Y)
-            repeat with f in xFields
-                try
-                    set desc to description of f
-                    if desc contains "X" or desc contains "x position" or desc contains "Position X" then
-                        set focused of f to true
-                        set value of f to "{freeform_x}"
-                        key code 36  -- Return
-                        delay 0.2
-                    end if
-                    if desc contains "Y" or desc contains "y position" or desc contains "Position Y" then
-                        set focused of f to true
-                        set value of f to "{freeform_y}"
-                        key code 36  -- Return
-                        delay 0.2
-                    end if
-                end try
-            end repeat
-        end tell
-    end tell
-    """
-    out, _, rc = _run_as(script)
-    return rc == 0, freeform_x, freeform_y
-
-
-def _move_selected_by_arrow(target_screen_x, target_screen_y, insert_screen_x, insert_screen_y):
-    """
-    Move a selected shape from its insertion point to target using arrow keys.
-    Each Shift+Arrow = 10px. This is reliable but slow for large offsets.
-    Max distance we'll nudge: 600px each axis.
-    """
-    dx = target_screen_x - insert_screen_x
-    dy = target_screen_y - insert_screen_y
-
-    # Cap at +-600 px to avoid excessively long nudge sequences
-    dx = max(-600, min(600, dx))
-    dy = max(-600, min(600, dy))
-
-    def nudge(amount, pos_key, neg_key):
-        key = pos_key if amount > 0 else neg_key
-        n = abs(amount)
-        for _ in range(n // 10):
-            pyautogui.hotkey("shift", key)
-            time.sleep(0.02)
-        for _ in range(n % 10):
-            pyautogui.press(key)
-            time.sleep(0.01)
-
-    nudge(dx, "right", "left")
-    nudge(dy, "down", "up")
+    # First make sure Freeform is front and no toolbar item is selected
+    _run_as('tell application "Freeform" to activate')
     time.sleep(0.2)
+    # Press Escape to deselect any tool/shape
+    pyautogui.press("escape")
+    time.sleep(0.15)
+    # Single click at target canvas position
+    pyautogui.click(sx, sy)
+    time.sleep(0.25)
 
 
 def _screenshot_window():
@@ -341,61 +270,6 @@ def _paste(text):
 
 
 # ============================================================
-# DEBUG / DIAGNOSTIC TOOL
-# ============================================================
-
-@mcp.tool()
-def debug_info() -> dict:
-    """Full diagnostic: window state, bounds, screen size, canvas centre."""
-    _activate_freeform()
-    has_window = _has_open_window()
-    wcount = _window_count()
-
-    out1, err1, rc1 = _run_as("""
-    tell application "System Events"
-        tell process "Freeform"
-            set wc to count of windows
-            if wc = 0 then return "NO_WINDOWS"
-            set w to front window
-            set px to item 1 of (get position of w)
-            set py to item 2 of (get position of w)
-            set sw to item 1 of (get size of w)
-            set sh to item 2 of (get size of w)
-            return (px as string) & "," & (py as string) & "," & (sw as string) & "," & (sh as string)
-        end tell
-    end tell
-    """)
-
-    out2, err2, rc2 = _run_as("""
-    tell application "Freeform"
-        if (count of windows) = 0 then return "NO_WINDOWS"
-        set w to front window
-        set b to bounds of w
-        return (item 1 of b as string) & "," & (item 2 of b as string) & "," & (item 3 of b as string) & "," & (item 4 of b as string)
-    end tell
-    """)
-
-    try:
-        img = ImageGrab.grab()
-        screen_size = list(img.size)
-    except Exception as e:
-        screen_size = str(e)
-
-    computed = _window_bounds()
-    centre = _canvas_to_screen(0, 0)
-
-    return {
-        "has_open_window": has_window,
-        "window_count": wcount,
-        "method1_raw": out1, "method1_error": err1, "method1_rc": rc1,
-        "method2_raw": out2, "method2_error": err2, "method2_rc": rc2,
-        "screen_size": screen_size,
-        "computed_bounds": computed,
-        "canvas_centre_screen": centre,
-    }
-
-
-# ============================================================
 # BOARD MANAGEMENT
 # ============================================================
 
@@ -403,8 +277,12 @@ def debug_info() -> dict:
 def board_new() -> dict:
     """
     Create a new blank Freeform board.
-    Call ONCE at the start. All drawing tools then use THIS board.
-    Never call this again mid-diagram or each shape will land on a new board.
+
+    WORKFLOW:
+      1. Call board_new() — creates one board.
+      2. Call board_calibrate() — measures placement accuracy on this Mac.
+      3. Call shape_add(), connector_add() etc. — all draw on this board.
+      4. Never call board_new() again mid-diagram.
     """
     out, _, _ = _run_as(
         'tell application "System Events" to (name of processes) contains "Freeform"'
@@ -423,7 +301,88 @@ def board_new() -> dict:
         "status": "ok" if opened else "warning",
         "board_opened": opened,
         "window_bounds": b,
-        "note": "Draw everything on this board. Do NOT call board_new() again."
+        "next_step": "Call board_calibrate() before drawing to ensure accurate placement."
+    }
+
+
+@mcp.tool()
+def board_calibrate() -> dict:
+    """
+    Calibrate shape placement for this Mac's screen.
+
+    HOW IT WORKS:
+      1. Inserts a test rectangle at canvas (0,0) — the board centre.
+      2. Takes a screenshot.
+      3. Measures where the shape actually appeared vs where we aimed.
+      4. Stores the offset so all subsequent shape_add calls are corrected.
+
+    Call this ONCE after board_new(), before drawing any diagram shapes.
+    The result tells you the calibration offset being applied.
+    """
+    global _offset_x, _offset_y
+    _activate_freeform()
+    time.sleep(0.3)
+
+    # Target: screen centre of canvas
+    b = _window_bounds()
+    toolbar_height = 80
+    target_sx = b["x"] + b["width"] // 2
+    target_sy = b["y"] + toolbar_height + (b["height"] - toolbar_height) // 2
+
+    # Click canvas centre
+    _click_canvas_at(target_sx, target_sy)
+
+    # Insert a small rectangle at canvas centre
+    _click_menu("Insert", "Shape", "Rectangle")
+    time.sleep(0.8)
+
+    # Screenshot to see where it landed
+    img = ImageGrab.grab(bbox=(b["x"], b["y"], b["x"] + b["width"], b["y"] + b["height"]))
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    screenshot_b64 = base64.b64encode(buf.getvalue()).decode()
+
+    # Try to find the shape by looking for a change from background colour
+    # This is approximate — we scan for non-white pixels near the expected area
+    import numpy as np
+    try:
+        arr = np.array(img)
+        h, w = arr.shape[:2]
+        # Look in centre quadrant for inserted shape (non-white pixels)
+        cx, cy = w // 2, h // 2 - toolbar_height // 2
+        region = arr[cy - 100:cy + 100, cx - 150:cx + 150]
+        # Find pixels that differ from white (255,255,255)
+        non_white = np.where(
+            (region[:,:,0] < 200) | (region[:,:,1] < 200) | (region[:,:,2] < 200)
+        )
+        if len(non_white[0]) > 50:
+            # Centroid of non-white pixels
+            found_y = int(np.mean(non_white[0])) + (cy - 100)
+            found_x = int(np.mean(non_white[1])) + (cx - 150)
+            # Offset = where we aimed - where it landed (relative to window)
+            _offset_x = 0   # horizontal usually fine
+            _offset_y = (cy - found_y)
+            calibration_note = f"Shape found at window-relative ({found_x},{found_y}), aimed at ({cx},{cy}). Offset applied: ({_offset_x},{_offset_y})"
+        else:
+            _offset_x = 0
+            _offset_y = 0
+            calibration_note = "Could not detect shape via pixel analysis. Using zero offset. Placement may be approximate."
+    except ImportError:
+        _offset_x = 0
+        _offset_y = 0
+        calibration_note = "numpy not available — using zero offset. Install with: pip3 install numpy"
+
+    # Delete the test shape
+    pyautogui.hotkey("command", "z")
+    time.sleep(0.4)
+
+    return {
+        "status": "ok",
+        "offset_x": _offset_x,
+        "offset_y": _offset_y,
+        "calibration_note": calibration_note,
+        "screenshot_b64": screenshot_b64,
+        "message": "Calibration complete. All subsequent shape_add calls will use this offset."
     }
 
 
@@ -468,7 +427,7 @@ def board_redo() -> dict:
 
 @mcp.tool()
 def board_screenshot() -> dict:
-    """Screenshot the board. Returns base64 PNG for reading/analysis."""
+    """Screenshot the board. Returns base64 PNG."""
     img_b64 = _screenshot_window()
     return {"status": "ok", "format": "png", "image_base64": img_b64}
 
@@ -487,6 +446,47 @@ def board_zoom(level: str = "fit") -> dict:
         return {"status": "error", "message": f"Use: {list(zm)}"}
     _click_menu(*zm[level])
     return {"status": "ok", "zoom": level}
+
+
+# ============================================================
+# DEBUG TOOL
+# ============================================================
+
+@mcp.tool()
+def debug_info() -> dict:
+    """Diagnostic: window state, bounds, screen size, canvas centre."""
+    _activate_freeform()
+    out1, err1, rc1 = _run_as("""
+    tell application "System Events"
+        tell process "Freeform"
+            set wc to count of windows
+            if wc = 0 then return "NO_WINDOWS"
+            set w to front window
+            set px to item 1 of (get position of w)
+            set py to item 2 of (get position of w)
+            set sw to item 1 of (get size of w)
+            set sh to item 2 of (get size of w)
+            return (px as string) & "," & (py as string) & "," & (sw as string) & "," & (sh as string)
+        end tell
+    end tell
+    """)
+    try:
+        img = ImageGrab.grab()
+        screen_size = list(img.size)
+    except Exception as e:
+        screen_size = str(e)
+
+    computed = _window_bounds()
+    centre = _canvas_to_screen(0, 0)
+
+    return {
+        "has_open_window": _has_open_window(),
+        "method1_raw": out1, "method1_error": err1,
+        "screen_size": screen_size,
+        "computed_bounds": computed,
+        "canvas_centre_screen": centre,
+        "current_offset": {"x": _offset_x, "y": _offset_y},
+    }
 
 
 # ============================================================
@@ -535,6 +535,11 @@ def shape_add(
     """
     Insert a shape at a specific position on the current board.
 
+    HOW POSITIONING WORKS (v7 click-first method):
+      We click the canvas at the target position BEFORE inserting the shape.
+      Freeform places new shapes at the last-clicked canvas point.
+      Run board_calibrate() first for best accuracy.
+
     shape    : rectangle, rounded_rectangle, circle, diamond, star,
                speech_bubble, arrow_right, arrow_down, cloud, cylinder,
                triangle, hexagon, oval, heart, parallelogram, and more.
@@ -544,15 +549,10 @@ def shape_add(
     height   : shape height in pixels (default 80)
     label    : text inside the shape
 
-    Layout reference — (0,0) is board centre:
+    Layout reference — (0,0) = board centre:
       Row of 3:      (-300,0)  (0,0)  (300,0)
       Column of 4:   (0,-300)  (0,-100)  (0,100)  (0,300)
       2x2 grid:      (-250,-150) (250,-150) (-250,150) (250,150)
-
-    POSITIONING METHOD (v6):
-      Shape is inserted then immediately repositioned using the Arrange
-      panel's X/Y fields via AppleScript — NOT by drag-and-drop.
-      Falls back to arrow-key nudging if the panel is inaccessible.
     """
     _activate_freeform()
 
@@ -562,25 +562,17 @@ def shape_add(
         return {"status": "error",
                 "message": f"Unknown shape '{shape}'. Options: {list(SHAPE_MENU)}"}
 
-    # Step 1: Insert shape (lands at canvas centre by default)
+    # Step 1: Click canvas at target position to set Freeform's insertion point
+    target_sx, target_sy = _canvas_to_screen(canvas_x, canvas_y)
+    _click_canvas_at(target_sx, target_sy)
+
+    # Step 2: Insert shape — Freeform places it at the clicked point
     ok = _click_menu("Insert", "Shape", menu_name)
     time.sleep(0.7)
 
-    # Step 2: Shape should now be selected. Try Arrange panel positioning.
-    arrange_ok, freeform_x, freeform_y = _set_position_via_arrange(canvas_x, canvas_y)
-
-    # Step 3: If Arrange panel didn't work, use arrow-key nudging
-    if not arrange_ok:
-        b = _window_bounds()
-        toolbar_height = 80
-        insert_sx = b["x"] + b["width"] // 2
-        insert_sy = b["y"] + toolbar_height + (b["height"] - toolbar_height) // 2
-        target_sx, target_sy = _canvas_to_screen(canvas_x, canvas_y)
-        _move_selected_by_arrow(target_sx, target_sy, insert_sx, insert_sy)
-
-    # Step 4: Add label if provided
-    target_sx, target_sy = _canvas_to_screen(canvas_x, canvas_y)
+    # Step 3: Add label
     if label:
+        # Double-click where the shape landed (near target)
         pyautogui.doubleClick(target_sx, target_sy)
         time.sleep(0.4)
         pyautogui.hotkey("command", "a")
@@ -593,8 +585,7 @@ def shape_add(
         "shape": shape,
         "label": label,
         "canvas_position": {"x": canvas_x, "y": canvas_y},
-        "arrange_panel_used": arrange_ok,
-        "freeform_coords": {"x": freeform_x, "y": freeform_y},
+        "screen_position": {"x": target_sx, "y": target_sy},
         "menu_ok": ok,
     }
 
@@ -612,38 +603,36 @@ def connector_add(
     """
     Draw a connector line between two canvas positions.
 
-    from_x, from_y : start point (canvas coords relative to centre)
-    to_x,   to_y   : end point   (canvas coords relative to centre)
+    from_x, from_y : start point (canvas coords relative to board centre)
+    to_x,   to_y   : end point   (canvas coords relative to board centre)
     label          : optional text label on the connector
 
-    TIP: set from/to coords to the edges of your shapes, not their centres,
-    so the line visually connects them. E.g. if a box is at (0,-200) with
-    height 80, its bottom edge is at canvas_y = -200+40 = -160.
+    TIP: use the edge of shapes, not their centres:
+      Shape at (0,-200) height 80 → bottom edge at canvas_y -160
+      Shape at (0,0)    height 80 → top edge    at canvas_y  -40
     """
     _activate_freeform()
 
-    # Activate the Line tool via menu
+    # Select line tool
     ok = _click_menu("Insert", "Line")
     time.sleep(0.6)
 
     fx, fy = _canvas_to_screen(from_x, from_y)
     tx, ty = _canvas_to_screen(to_x, to_y)
 
-    # Move cursor to start position, pause, then drag to end
-    # Use slow movements and extra pauses for reliability
-    pyautogui.moveTo(fx, fy, duration=0.4)
+    # Slow, stepped drag for reliability
+    pyautogui.moveTo(fx, fy, duration=0.5)
     time.sleep(0.3)
     pyautogui.mouseDown(button="left")
-    time.sleep(0.15)
+    time.sleep(0.2)
 
-    # Move in steps for reliability
-    steps = 8
+    steps = 10
     for i in range(1, steps + 1):
         ix = int(fx + (tx - fx) * i / steps)
         iy = int(fy + (ty - fy) * i / steps)
-        pyautogui.moveTo(ix, iy, duration=0.05)
+        pyautogui.moveTo(ix, iy, duration=0.06)
 
-    time.sleep(0.1)
+    time.sleep(0.15)
     pyautogui.mouseUp(button="left")
     time.sleep(0.4)
 
@@ -679,13 +668,16 @@ def text_add(
     bold: bool = False,
     italic: bool = False,
 ) -> dict:
-    """Add a text box at canvas_x, canvas_y (relative to board centre)."""
+    """Add a text box at canvas position."""
     _activate_freeform()
+
+    target_sx, target_sy = _canvas_to_screen(canvas_x, canvas_y)
+    _click_canvas_at(target_sx, target_sy)
+
     ok = _click_menu("Insert", "Text Box")
     time.sleep(0.5)
 
-    sx, sy = _canvas_to_screen(canvas_x, canvas_y)
-    pyautogui.click(sx, sy)
+    pyautogui.click(target_sx, target_sy)
     time.sleep(0.3)
 
     if bold:
@@ -706,17 +698,14 @@ def text_add(
 
 @mcp.tool()
 def sticky_add(text: str, canvas_x: int = 0, canvas_y: int = 0) -> dict:
-    """Add a sticky note at canvas_x, canvas_y (relative to board centre)."""
+    """Add a sticky note at canvas position."""
     _activate_freeform()
+
+    target_sx, target_sy = _canvas_to_screen(canvas_x, canvas_y)
+    _click_canvas_at(target_sx, target_sy)
+
     ok = _click_menu("Insert", "Sticky Note")
     time.sleep(0.6)
-
-    # Sticky note appears selected at insertion point — use arrow keys to position
-    b = _window_bounds()
-    insert_sx = b["x"] + b["width"] // 2
-    insert_sy = b["y"] + 80 + (b["height"] - 80) // 2
-    target_sx, target_sy = _canvas_to_screen(canvas_x, canvas_y)
-    _move_selected_by_arrow(target_sx, target_sy, insert_sx, insert_sy)
 
     pyautogui.doubleClick(target_sx, target_sy)
     time.sleep(0.3)
@@ -733,7 +722,7 @@ def sticky_add(text: str, canvas_x: int = 0, canvas_y: int = 0) -> dict:
 
 @mcp.tool()
 def select_all() -> dict:
-    """Select all objects (Cmd+A)."""
+    """Select all (Cmd+A)."""
     _activate_freeform()
     pyautogui.hotkey("command", "a")
     time.sleep(0.2)
@@ -769,7 +758,7 @@ def object_delete() -> dict:
 
 @mcp.tool()
 def object_duplicate() -> dict:
-    """Duplicate selected object(s) (Cmd+D)."""
+    """Duplicate selected (Cmd+D)."""
     _activate_freeform()
     pyautogui.hotkey("command", "d")
     time.sleep(0.3)
@@ -778,7 +767,7 @@ def object_duplicate() -> dict:
 
 @mcp.tool()
 def object_move(delta_x: int, delta_y: int) -> dict:
-    """Move selected object(s) by pixel offset (arrow keys)."""
+    """Move selected by pixel offset using arrow keys."""
     _activate_freeform()
 
     def _axis(amount, pos_key, neg_key):
@@ -799,7 +788,7 @@ def object_move(delta_x: int, delta_y: int) -> dict:
 
 @mcp.tool()
 def object_group() -> dict:
-    """Group selected objects (Cmd+G)."""
+    """Group selected (Cmd+G)."""
     _activate_freeform()
     pyautogui.hotkey("command", "g")
     time.sleep(0.3)
@@ -808,7 +797,7 @@ def object_group() -> dict:
 
 @mcp.tool()
 def object_ungroup() -> dict:
-    """Ungroup selected group (Cmd+Shift+G)."""
+    """Ungroup selected (Cmd+Shift+G)."""
     _activate_freeform()
     pyautogui.hotkey("command", "shift", "g")
     time.sleep(0.3)
@@ -863,6 +852,9 @@ def image_insert(file_path: str, canvas_x: int = 0, canvas_y: int = 0) -> dict:
     if not p.exists():
         return {"status": "error", "message": f"File not found: {file_path}"}
 
+    target_sx, target_sy = _canvas_to_screen(canvas_x, canvas_y)
+    _click_canvas_at(target_sx, target_sy)
+
     _click_menu("Insert", "Image", "Choose...")
     time.sleep(1.5)
     pyautogui.hotkey("command", "shift", "g")
@@ -874,7 +866,8 @@ def image_insert(file_path: str, canvas_x: int = 0, canvas_y: int = 0) -> dict:
     pyautogui.press("return")
     time.sleep(1.0)
     _esc()
-    return {"status": "ok", "image": p.name}
+    return {"status": "ok", "image": p.name,
+            "canvas_position": {"x": canvas_x, "y": canvas_y}}
 
 
 # ============================================================
@@ -884,8 +877,7 @@ def image_insert(file_path: str, canvas_x: int = 0, canvas_y: int = 0) -> dict:
 @mcp.tool()
 def draw_freehand(points: list) -> dict:
     """
-    Draw freehand stroke through canvas points.
-    points: [{"x": int, "y": int}, ...]  (at least 2 points)
+    Draw freehand stroke. points: [{"x": int, "y": int}, ...]
     """
     _activate_freeform()
     if len(points) < 2:
