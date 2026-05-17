@@ -1,13 +1,15 @@
 """
-freeform_mcp_server.py  (v3 — auto-opens board if none is open)
-================================================================
+freeform_mcp_server.py  (v4 — robust board opening via AppleScript UI + make new document)
+===========================================================================================
 MCP server connecting Claude AI to Apple Freeform.
 macOS only. Python 3.10+.
 
-Key fix in v3: _ensure_freeform() now detects when Freeform is on
-the gallery/start screen (no open window) and automatically opens
-a new board via Cmd+N, so Claude never needs to ask the user to
-do it manually.
+v4 fixes: _open_new_board() now tries four escalating methods to open a board:
+  1. AppleScript "make new document" (most reliable, app-level command)
+  2. Click "New Board" button in the gallery window via Accessibility API
+  3. File > New Board menu item
+  4. Cmd+N keyboard shortcut with extended focus delay
+This means Claude never needs to ask the user to manually open a board.
 """
 
 import base64
@@ -35,15 +37,29 @@ def _run_as(script):
     return r.stdout.strip(), r.stderr.strip(), r.returncode
 
 
+def _window_count():
+    """Return the number of Freeform windows currently open."""
+    out, _, rc = _run_as("""
+    tell application "System Events"
+        tell process "Freeform"
+            return count of windows
+        end tell
+    end tell
+    """)
+    try:
+        return int(out)
+    except Exception:
+        return 0
+
+
 def _has_open_window():
-    """Return True if Freeform has at least one open (non-minimised) window."""
+    """Return True if Freeform has at least one visible (non-minimised) window."""
     out, _, rc = _run_as("""
     tell application "System Events"
         tell process "Freeform"
             set wc to count of windows
             if wc = 0 then return "none"
-            set w to front window
-            if minimized of w then return "minimised"
+            if minimized of front window then return "minimised"
             return "open"
         end tell
     end tell
@@ -51,13 +67,106 @@ def _has_open_window():
     return out == "open"
 
 
+def _open_new_board():
+    """
+    Try four escalating methods to open a new Freeform board.
+    Returns True as soon as a window appears.
+    """
+
+    # --- Method 1: AppleScript make new document ---
+    # This is the most reliable as it talks directly to the app.
+    out1, err1, rc1 = _run_as('tell application "Freeform" to make new document')
+    time.sleep(2.0)
+    if _has_open_window():
+        return True
+
+    # --- Method 2: Click "New Board" button in the gallery via Accessibility ---
+    # Freeform's gallery has a toolbar button labelled "New Board"
+    script2 = """
+    tell application "System Events"
+        tell process "Freeform"
+            -- Try toolbar button first
+            try
+                set btns to every button of toolbar 1 of front window
+                repeat with b in btns
+                    if description of b contains "New Board" or name of b contains "New Board" then
+                        click b
+                        return "clicked toolbar"
+                    end if
+                end repeat
+            end try
+            -- Try any button in any window labelled New Board
+            try
+                set allWins to every window
+                repeat with w in allWins
+                    set allBtns to every button of w
+                    repeat with b in allBtns
+                        if description of b contains "New" or name of b contains "New" then
+                            click b
+                            return "clicked window button"
+                        end if
+                    end repeat
+                end repeat
+            end try
+            return "not found"
+        end tell
+    end tell
+    """
+    _run_as(script2)
+    time.sleep(2.0)
+    if _has_open_window():
+        return True
+
+    # --- Method 3: File > New Board menu item ---
+    script3 = """
+    tell application "System Events"
+        tell process "Freeform"
+            tell menu bar 1
+                tell menu bar item "File"
+                    tell menu "File"
+                        click menu item "New Board"
+                    end tell
+                end tell
+            end tell
+        end tell
+    end tell
+    """
+    _run_as(script3)
+    time.sleep(2.0)
+    if _has_open_window():
+        return True
+
+    # --- Method 4: Cmd+N with generous focus delay ---
+    _run_as('tell application "Freeform" to activate')
+    time.sleep(1.5)   # give the gallery time to fully render and accept input
+    pyautogui.hotkey("command", "n")
+    time.sleep(2.5)
+    if _has_open_window():
+        return True
+
+    # --- Method 5: Try clicking the centre of the screen (gallery "New Board" tile) ---
+    try:
+        img = ImageGrab.grab()
+        sw, sh = img.size
+        # The "New Board" tile in the gallery is usually in the top-left of the grid
+        # Click approximately where it would be
+        pyautogui.click(sw // 2 - 200, sh // 2 - 100)
+        time.sleep(1.5)
+        if _has_open_window():
+            return True
+        # Try double-click
+        pyautogui.doubleClick(sw // 2 - 200, sh // 2 - 100)
+        time.sleep(1.5)
+    except Exception:
+        pass
+
+    return _has_open_window()
+
+
 def _ensure_freeform():
     """
-    Make sure Freeform is running AND has a visible board window.
-    - If not running: launch it.
-    - If running but no window (gallery screen or all minimised): open a new board.
-    - If minimised: unminimise.
-    Always brings Freeform to the front.
+    Guarantee that Freeform is running and has a visible board window.
+    Handles: not running, gallery screen, minimised window.
     """
     # 1. Launch if not running
     out, _, _ = _run_as(
@@ -65,14 +174,14 @@ def _ensure_freeform():
     )
     if out != "true":
         subprocess.Popen(["open", "-a", "Freeform"])
-        time.sleep(3.5)
+        time.sleep(4.0)  # wait for full launch including gallery render
 
     # 2. Activate
     _run_as('tell application "Freeform" to activate')
-    time.sleep(0.5)
+    time.sleep(0.8)
 
-    # 3. Check for open window
-    state_out, _, _ = _run_as("""
+    # 3. Check window state
+    out2, _, _ = _run_as("""
     tell application "System Events"
         tell process "Freeform"
             set wc to count of windows
@@ -83,8 +192,7 @@ def _ensure_freeform():
     end tell
     """)
 
-    if state_out == "minimised":
-        # Unminimise by clicking the window in the Dock or via AppleScript
+    if out2 == "minimised":
         _run_as("""
         tell application "System Events"
             tell process "Freeform"
@@ -92,18 +200,15 @@ def _ensure_freeform():
             end tell
         end tell
         """)
-        time.sleep(0.6)
+        time.sleep(0.8)
 
-    elif state_out in ("none", ""):
-        # Gallery screen or no window — open a new board
-        _run_as('tell application "Freeform" to activate')
-        time.sleep(0.4)
-        pyautogui.hotkey("command", "n")
-        time.sleep(2.0)   # wait for new board to appear
+    elif out2 in ("none", ""):
+        # No board open — use our robust opener
+        _open_new_board()
 
-    # 4. Final activate to ensure it's frontmost
+    # 4. Final activate
     _run_as('tell application "Freeform" to activate')
-    time.sleep(0.3)
+    time.sleep(0.4)
 
 
 def _window_bounds():
@@ -111,7 +216,7 @@ def _window_bounds():
     Return {x, y, width, height} of the front Freeform window.
     Tries three methods; falls back to full-screen estimate.
     """
-    # Method 1: System Events position + size (separate gets — more reliable)
+    # Method 1: System Events
     out1, _, rc1 = _run_as("""
     tell application "System Events"
         tell process "Freeform"
@@ -132,7 +237,7 @@ def _window_bounds():
         except ValueError:
             pass
 
-    # Method 2: Ask Freeform via its own bounds property
+    # Method 2: Ask Freeform directly via bounds
     out2, _, rc2 = _run_as("""
     tell application "Freeform"
         set w to front window
@@ -148,7 +253,7 @@ def _window_bounds():
         except ValueError:
             pass
 
-    # Method 3: Use screen size and assume full-screen window
+    # Method 3: Screen size fallback
     try:
         img = ImageGrab.grab()
         sw, sh = img.size
@@ -156,21 +261,20 @@ def _window_bounds():
     except Exception:
         pass
 
-    # Last resort
     return {"x": 0, "y": 28, "width": 1440, "height": 872}
 
 
 def _canvas_to_screen(cx, cy):
-    """Canvas (0,0) = centre of Freeform content area (below toolbar)."""
+    """Canvas (0,0) = centre of Freeform content area."""
     b = _window_bounds()
-    toolbar_height = 80   # approximate title bar + toolbar
+    toolbar_height = 80
     sx = b["x"] + b["width"] // 2 + cx
     sy = b["y"] + toolbar_height + (b["height"] - toolbar_height) // 2 + cy
     return int(sx), int(sy)
 
 
 def _screenshot_window():
-    """Capture Freeform window; return base64 PNG string."""
+    """Capture Freeform window as base64 PNG."""
     _ensure_freeform()
     time.sleep(0.4)
     b = _window_bounds()
@@ -227,7 +331,7 @@ def _esc():
 
 
 def _paste(text):
-    """Copy text to clipboard then paste into active field."""
+    """Put text on clipboard and paste."""
     safe = text.replace("\\", "\\\\").replace('"', '\\"')
     _run_as(f'set the clipboard to "{safe}"')
     pyautogui.hotkey("command", "v")
@@ -241,13 +345,14 @@ def _paste(text):
 @mcp.tool()
 def debug_info() -> dict:
     """
-    Diagnostic tool — returns raw window state, AppleScript outputs,
-    screen size, computed bounds and canvas centre.
-    Run this first if any drawing tools fail.
+    Diagnostic tool. Returns full window state, AppleScript outputs,
+    computed bounds, and canvas centre coords.
+    Call this first if drawing tools are failing.
     """
     _ensure_freeform()
 
     has_window = _has_open_window()
+    wcount = _window_count()
 
     out1, err1, rc1 = _run_as("""
     tell application "System Events"
@@ -273,6 +378,19 @@ def debug_info() -> dict:
     end tell
     """)
 
+    # List all window names
+    out3, _, _ = _run_as("""
+    tell application "System Events"
+        tell process "Freeform"
+            set names to {}
+            repeat with w in windows
+                set end of names to (name of w as string) & " [min=" & (minimized of w as string) & "]"
+            end repeat
+            return names as string
+        end tell
+    end tell
+    """)
+
     try:
         img = ImageGrab.grab()
         screen_size = list(img.size)
@@ -284,6 +402,8 @@ def debug_info() -> dict:
 
     return {
         "has_open_window": has_window,
+        "window_count": wcount,
+        "window_names": out3,
         "method1_raw": out1, "method1_error": err1, "method1_rc": rc1,
         "method2_raw": out2, "method2_error": err2, "method2_rc": rc2,
         "screen_size": screen_size,
@@ -300,17 +420,29 @@ def debug_info() -> dict:
 def board_new() -> dict:
     """
     Open Freeform and create a brand-new blank board.
-    Automatically handles the case where Freeform is on the gallery
-    screen or has no open window.
+    Handles gallery screen, no windows, and minimised windows automatically.
     """
-    _ensure_freeform()   # already handles gallery → new board
-    # If a board was auto-opened by _ensure_freeform, we are done.
-    # If a board was already open, open another new one.
-    if _has_open_window():
-        pyautogui.hotkey("command", "n")
-        time.sleep(1.5)
+    # Launch/activate first
+    out, _, _ = _run_as(
+        'tell application "System Events" to (name of processes) contains "Freeform"'
+    )
+    if out != "true":
+        subprocess.Popen(["open", "-a", "Freeform"])
+        time.sleep(4.0)
+
+    _run_as('tell application "Freeform" to activate')
+    time.sleep(1.0)
+
+    # Always open a fresh board
+    opened = _open_new_board()
+    time.sleep(0.5)
     b = _window_bounds()
-    return {"status": "ok", "window_bounds": b}
+    return {
+        "status": "ok" if opened else "warning",
+        "board_opened": opened,
+        "window_bounds": b,
+        "note": "If board_opened is false, Freeform may need Accessibility permission. Check System Settings > Privacy & Security > Accessibility and ensure Terminal is listed."
+    }
 
 
 @mcp.tool()
@@ -355,8 +487,8 @@ def board_redo() -> dict:
 @mcp.tool()
 def board_screenshot() -> dict:
     """
-    Take a screenshot of the current Freeform board.
-    Returns a base64 PNG. Use this to READ what is on the board.
+    Screenshot the current Freeform board. Returns base64 PNG.
+    Use this to READ what is on the board.
     """
     img_b64 = _screenshot_window()
     return {"status": "ok", "format": "png", "image_base64": img_b64}
@@ -364,7 +496,7 @@ def board_screenshot() -> dict:
 
 @mcp.tool()
 def board_zoom(level: str = "fit") -> dict:
-    """Zoom the canvas. level: fit, in, out, 100"""
+    """Zoom: fit, in, out, 100"""
     _ensure_freeform()
     zm = {
         "fit": ("View", "Zoom to Fit"),
@@ -426,19 +558,16 @@ def shape_add(
 
     shape    : rectangle, rounded_rectangle, circle, diamond, star,
                speech_bubble, arrow_right, arrow_down, cloud, cylinder,
-               triangle, hexagon, and 15 more options.
-    canvas_x : horizontal offset from board centre in pixels.
-               Negative = left, positive = right.
-    canvas_y : vertical offset from board centre in pixels.
-               Negative = up, positive = down.
+               triangle, hexagon, oval, heart, and more.
+    canvas_x : pixels from board centre. Negative=left, positive=right.
+    canvas_y : pixels from board centre. Negative=up,   positive=down.
     width    : shape width  in pixels (default 150)
     height   : shape height in pixels (default 80)
-    label    : text label inside the shape (optional)
+    label    : text label inside the shape
 
-    Layout examples (0,0 = board centre):
-      Row of 3:      (-300,0)   (0,0)   (300,0)
-      Column of 3:   (0,-200)   (0,0)   (0,200)
-      2x2 grid:      (-200,-150) (200,-150) (-200,150) (200,150)
+    Layout examples — (0,0) is board centre:
+      Row of 3:     (-300,0)  (0,0)  (300,0)
+      Column of 4:  (0,-300)  (0,-100)  (0,100)  (0,300)
     """
     _ensure_freeform()
     key = shape.lower().replace(" ", "_")
@@ -493,10 +622,9 @@ def connector_add(
 ) -> dict:
     """
     Draw a connector line between two canvas positions.
-
-    from_x, from_y : start point (canvas coords, relative to centre)
-    to_x,   to_y   : end point   (canvas coords, relative to centre)
-    label          : optional text label on the connector
+    from_x/y: start point relative to board centre.
+    to_x/y:   end point relative to board centre.
+    label:    optional text on the connector.
     """
     _ensure_freeform()
     ok = _click_menu("Insert", "Line")
@@ -578,9 +706,8 @@ def sticky_add(text: str, canvas_x: int = 0, canvas_y: int = 0) -> dict:
     time.sleep(0.6)
 
     b = _window_bounds()
-    toolbar_height = 80
     cx = b["x"] + b["width"] // 2
-    cy = b["y"] + toolbar_height + (b["height"] - toolbar_height) // 2
+    cy = b["y"] + 80 + (b["height"] - 80) // 2
     tx, ty = _canvas_to_screen(canvas_x, canvas_y)
 
     pyautogui.moveTo(cx, cy, duration=0.2)
@@ -650,7 +777,7 @@ def object_duplicate() -> dict:
 @mcp.tool()
 def object_move(delta_x: int, delta_y: int) -> dict:
     """
-    Move selected object(s) by pixel offset using arrow keys.
+    Move selected object(s) by pixel offset.
     delta_x: positive=right, negative=left.
     delta_y: positive=down,  negative=up.
     """
@@ -696,12 +823,10 @@ def object_ungroup() -> dict:
 def arrange(action: str) -> dict:
     """
     Arrange or align selected objects.
-
-    action options:
-      align_left, align_right, align_top, align_bottom,
-      center_h, center_v, distribute_h, distribute_v,
-      bring_front, bring_forward, send_back, send_backward,
-      group, ungroup
+    action: align_left, align_right, align_top, align_bottom,
+            center_h, center_v, distribute_h, distribute_v,
+            bring_front, bring_forward, send_back, send_backward,
+            group, ungroup
     """
     _ensure_freeform()
     actions = {
@@ -734,8 +859,7 @@ def arrange(action: str) -> dict:
 def image_insert(file_path: str, canvas_x: int = 0, canvas_y: int = 0) -> dict:
     """
     Insert a PNG, JPG, or GIF image onto the board.
-    file_path: absolute path to the image file.
-    canvas_x, canvas_y: where to place it (relative to board centre).
+    file_path: absolute path. canvas_x/y: position relative to board centre.
     """
     _ensure_freeform()
     p = Path(file_path).expanduser()
@@ -773,7 +897,7 @@ def image_insert(file_path: str, canvas_x: int = 0, canvas_y: int = 0) -> dict:
 @mcp.tool()
 def draw_freehand(points: list) -> dict:
     """
-    Draw a freehand pen stroke through a series of canvas points.
+    Draw a freehand pen stroke through canvas points.
     points: list of {"x": int, "y": int} dicts.
     Example: [{"x": -100, "y": 0}, {"x": 0, "y": -50}, {"x": 100, "y": 0}]
     """
